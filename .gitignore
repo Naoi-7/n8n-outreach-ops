@@ -1,0 +1,6 @@
+# Nothing here holds secrets -- n8n credentials live in n8n. Still:
+.env
+.env.*
+*.local.json
+node_modules/
+.DS_Store

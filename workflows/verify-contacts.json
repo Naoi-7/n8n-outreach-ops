@@ -1,0 +1,353 @@
+{
+  "name": "verify-contacts",
+  "nodes": [
+    {
+      "id": "ea59983a-6722-4a91-b28c-0b2006b34936",
+      "name": "When clicking ‘Execute workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        -600,
+        -176
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "c3000000-0000-4000-8000-000000000001",
+      "name": "Run settings",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        -390,
+        -176
+      ],
+      "parameters": {
+        "jsCode": "// ===========================================================================\n//  RUN SETTINGS — the only node you normally touch.\n// ===========================================================================\n\n// Which source lists to verify. Separate tags with | . Examples:\n//   'example_list'             one list\n//   'list_a|list_b'            two lists at once\nconst SOURCES = 'example_list';\n\n// true  = only companies whose `sources` holds this tag and nothing else. A\n//         company that also arrived through another list is skipped — those\n//         lists carry their own campaign history, and mixing them makes the\n//         numbers unreadable.\n// false = any company carrying the tag, however many others it also carries.\nconst ONLY_THIS_SOURCE = true;\n\n// true  = skip any company that already has an outreach_log row. Those were\n//         mailed in an earlier campaign and most already carry a real\n//         email_status (sent / bounced / replied), which is better evidence\n//         than a verifier result and costs nothing.\nconst SKIP_CONTACTED = true;\n\n// How many companies to draw at random from what is left. 0 = no cap, take\n// everything. Every unchecked address of a drawn company comes along, so the\n// address count lands a little above this number.\nconst COMPANIES = 300;\n\n// ===========================================================================\n\n// Interpolated into SQL below, so keep the tags to safe characters.\nconst tags = SOURCES.split('|').map(t => t.trim()).filter(Boolean);\nif (!tags.length) throw new Error('SOURCES is empty');\nfor (const t of tags) {\n  if (!/^[A-Za-z0-9_()-]+$/.test(t)) throw new Error(`bad source tag: ${t}`);\n}\nif (!Number.isInteger(COMPANIES) || COMPANIES < 0) {\n  throw new Error('COMPANIES must be a whole number, 0 or more');\n}\n\nreturn [{\n  json: {\n    sources: tags.join('|'),\n    only_this_source: ONLY_THIS_SOURCE,\n    skip_contacted: SKIP_CONTACTED,\n    no_cap: COMPANIES === 0,\n    company_limit: COMPANIES === 0 ? 'all' : String(COMPANIES),\n  },\n}];"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "27b42d56-bc13-450f-9fb8-9a846ac227e2",
+      "name": "Execute a SQL query",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        -180,
+        -176
+      ],
+      "parameters": {
+        "query": "-- Addresses from the chosen source lists that have never been checked.\n--\n-- `sources` is comma-separated multi-value, so match per element -- never\n-- with = on the whole field, which silently drops rows carrying two tags.\n--\n-- Left out on purpose:\n--   company do_not_contact / unsubscribed / in_touch -- blocked, or already\n--                                                       in a live thread\n--   email_status = 'bounced'   -- already known dead, no point paying\n--   malformed addresses        -- a scraper wrote the literal string\n--                                 \"not found\" into some and cut others off\n--                                 before the TLD. A verifier charges for each\n--                                 and can only ever answer \"invalid\".\n--\n-- THE DRAW IS BY COMPANY, NOT BY ADDRESS. `pool` picks companies at random,\n-- then every unchecked address at those companies comes along. \"300\n-- companies\" therefore means a fair 300-company slice of the list, not 300\n-- addresses that might cluster on a handful of firms.\n--\n-- Company-less contacts (freemail with no companies row) have no company to\n-- draw, so they only take part when COMPANIES = 0 -- see the final WHERE.\n--\n-- Re-run guard is verification_checked_at: stopping and restarting never pays\n-- for the same address twice. A restart draws a fresh random slice from\n-- whatever is still unchecked, which is still a fair sample.\nwith settings as (\n  select '{{ $('Run settings').first().json.sources }}' as sources,\n         {{ $('Run settings').first().json.only_this_source }}::boolean as only_this_source,\n         {{ $('Run settings').first().json.skip_contacted }}::boolean   as skip_contacted,\n         {{ $('Run settings').first().json.no_cap }}::boolean           as no_cap\n),\nusable as (\n  -- one row per address that is actually worth paying to check\n  select c.id, c.email, c.company_key\n    from contacts c\n   where c.verification_checked_at is null\n     and c.email_status is distinct from 'bounced'\n     and lower(c.email) ~ '^[^@[:space:]]+@[^@[:space:]]+\\.[a-z]{2,}$'\n     and exists (\n           select 1 from unnest(string_to_array(c.sources, ',')) s\n            where trim(s) = any (string_to_array((select sources from settings), '|'))\n         )\n),\npool as (\n  select co.company_key\n    from companies co, settings st\n   where co.contact_status is null\n     and exists (select 1 from usable u where u.company_key = co.company_key)\n     and (not st.only_this_source\n          or array_length(string_to_array(co.sources, ','), 1) = 1)\n     and (not st.skip_contacted\n          or not exists (select 1 from outreach_log o\n                          where o.company_key = co.company_key))\n   order by random()\n   limit {{ $('Run settings').first().json.company_limit }}\n)\nselect u.id, u.email\n  from usable u, settings st\n where u.company_key in (select company_key from pool)\n    or (u.company_key is null and st.no_cap)\n order by u.id;",
+        "options": {},
+        "operation": "executeQuery"
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Postgres"
+        }
+      },
+      "executeOnce": true,
+      "typeVersion": 2.7
+    },
+    {
+      "id": "5d3802fd-46ba-41df-9930-619c4e312ee4",
+      "name": "Limit (safety cap 400)",
+      "type": "n8n-nodes-base.limit",
+      "position": [
+        30,
+        -176
+      ],
+      "parameters": {
+        "maxItems": 400
+      },
+      "typeVersion": 1
+    },
+    {
+      "id": "c4000000-0000-4000-8000-000000000001",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "position": [
+        240,
+        -176
+      ],
+      "parameters": {
+        "options": {},
+        "batchSize": 10
+      },
+      "typeVersion": 3
+    },
+    {
+      "id": "a364864e-394c-45a0-af42-c7220ef5903e",
+      "name": "HTTP Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "onError": "continueRegularOutput",
+      "maxTries": 2,
+      "position": [
+        470,
+        -60
+      ],
+      "parameters": {
+        "url": "https://api.millionverifier.com/api/v3/",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 10,
+              "batchInterval": 2000
+            }
+          }
+        },
+        "sendQuery": true,
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "timeout",
+              "value": "10"
+            }
+          ]
+        }
+      },
+      "credentials": {
+        "httpQueryAuth": {
+          "name": "Verifier API"
+        }
+      },
+      "retryOnFail": true,
+      "typeVersion": 4.5,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "5592b245-7017-46c8-ab63-dfba3783f8d4",
+      "name": "Classify Result",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        680,
+        -60
+      ],
+      "parameters": {
+        "jsCode": "// Turn a verifier response into the values contacts.verification_status\n// allows ('valid' / 'not valid' -- there is a CHECK constraint).\n//\n// Keep this mapping identical across runs so results stay comparable over\n// time. catch_all and unknown count as valid: low bounce risk, not confirmed.\nconst map = {\n  ok:         { status: 'valid',     detail: 'Deliverable' },\n  catch_all:  { status: 'valid',     detail: 'Catch-all domain - mailbox not individually confirmed, low bounce risk' },\n  unknown:    { status: 'valid',     detail: 'Unconfirmed - mail server gave no definitive answer (common for large providers), low bounce risk' },\n  invalid:    { status: 'not valid', detail: 'Invalid mailbox - will bounce' },\n  disposable: { status: 'not valid', detail: 'Disposable/temporary address' },\n};\n\n// Match the API response back to its contact row by email, not by position --\n// the verifier echoes the address back, and that survives retries.\nconst byEmail = new Map(\n  $('Execute a SQL query').all().map(i => [String(i.json.email).toLowerCase(), i.json])\n);\n\nconst today = new Date().toISOString().slice(0, 10);\nconst out = [];\n\nfor (const item of $input.all()) {\n  const resp = item.json;\n  const hit  = map[resp.result];\n\n  // No recognised verdict means an API error, an exhausted key, or a result\n  // value the verifier did not use before. Stop rather than write a guess:\n  // rows already saved keep their verification_checked_at, so re-running picks\n  // up exactly where this stopped and never pays for the same address twice.\n  if (!hit) {\n    throw new Error(\n      'Verifier gave no usable result for ' + (resp.email || '(no email in response)') +\n      ' -- result=' + JSON.stringify(resp.result) +\n      ' error=' + JSON.stringify(resp.error)\n    );\n  }\n\n  const src = byEmail.get(String(resp.email || '').toLowerCase());\n  if (!src) {\n    throw new Error('Response for ' + resp.email + ' does not match any row from the SQL query');\n  }\n\n  out.push({ json: {\n    id: src.id,\n    email: src.email,\n    verification_status: hit.status,\n    verification_details: hit.detail,\n    verification_source: 'millionverifier',\n    verification_checked_at: today,\n  }});\n}\n\nreturn out;\n"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "ff61c6da-06ab-498f-af30-1735edc8403d",
+      "name": "Save verification result",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        890,
+        -60
+      ],
+      "parameters": {
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "contacts",
+          "cachedResultName": "contacts"
+        },
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "columns": {
+          "value": {
+            "id": "={{ $json.id }}",
+            "verification_source": "={{ $json.verification_source }}",
+            "verification_status": "={{ $json.verification_status }}",
+            "verification_details": "={{ $json.verification_details }}",
+            "verification_checked_at": "={{ $json.verification_checked_at }}"
+          },
+          "schema": [
+            {
+              "id": "id",
+              "type": "number",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "id",
+              "defaultMatch": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "verification_status",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "verification_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "verification_details",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "verification_details",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "verification_source",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "verification_source",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "verification_checked_at",
+              "type": "dateTime",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "verification_checked_at",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "id"
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {},
+        "operation": "update"
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Postgres"
+        }
+      },
+      "typeVersion": 2.7,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "c4000000-0000-4000-8000-000000000002",
+      "name": "Wait 2s",
+      "type": "n8n-nodes-base.wait",
+      "position": [
+        1100,
+        -60
+      ],
+      "webhookId": "c4f1a2b3-0000-4000-8000-000000000002",
+      "parameters": {
+        "amount": 2
+      },
+      "typeVersion": 1.1
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Run settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run settings": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Limit (safety cap 400)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit (safety cap 400)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "Classify Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Result": {
+      "main": [
+        [
+          {
+            "node": "Save verification result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save verification result": {
+      "main": [
+        [
+          {
+            "node": "Wait 2s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 2s": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

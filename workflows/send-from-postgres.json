@@ -1,0 +1,645 @@
+{
+  "name": "send-from-postgres",
+  "nodes": [
+    {
+      "id": "6cecb568-efcc-406e-90bd-da0acd14e41d",
+      "name": "When clicking ‘Execute workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        -624,
+        -176
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "f8dbbf19-8d9a-439d-8fe1-346a2a656160",
+      "name": "Run settings",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        -400,
+        -176
+      ],
+      "parameters": {
+        "jsCode": "// ===========================================================================\n//  RUN SETTINGS — the only node you normally touch.\n// ===========================================================================\n\n// Which outreach_log campaign this send belongs to, and which contact source\n// list to draw from. Keeping both equal to the list's tag puts every touch\n// to that list on one timeline.\nconst CAMPAIGN = 'example_list';\nconst SOURCE   = 'example_list';\n\n// true = only companies whose `sources` holds SOURCE and nothing else. A firm\n// that also came in through another list is skipped — those lists carry\n// their own campaign history.\nconst ONLY_THIS_SOURCE = true;\n\n// Which row of the `offers` table to send, and the week shown in the subject\n// line and the opening sentence. Bump OFFER_ID for every new offer: it is\n// what stops the same offer reaching a company twice.\nconst OFFER_ID = 'offer_001';\nconst WEEK     = '38';        // '38' or '38-39'\n\n// 'new'    = companies with no outreach_log row at all — never touched by\n//            anyone, in any campaign. The first send to a fresh list.\n// 'repeat' = companies already touched in THIS campaign, for a later offer.\nconst MODE = 'new';\n\n// repeat mode only: how many days must have passed since that company's last\n// touch in this campaign. 1 = not today. Stops a second offer landing hours\n// after the first when a batch went out the same day.\nconst MIN_DAYS_SINCE_LAST = 1;\n\n// Goes into outreach_log.products — what this offer actually covered.\nconst PRODUCTS = 'human consumption';\n\n// How many companies this run mails. One address per company; the batch is\n// split evenly between sender A and sender B.\nconst BATCH = 175;\n\n// ===========================================================================\n\n// These are interpolated into SQL by string substitution, so keep them to\n// safe characters. A typo stops the run here rather than building a strange\n// query.\nconst SAFE = /^[A-Za-z0-9_()-]+$/;\nif (!SAFE.test(CAMPAIGN)) throw new Error('CAMPAIGN: letters, digits, _ ( ) - only');\nif (!SAFE.test(SOURCE))   throw new Error('SOURCE: letters, digits, _ ( ) - only');\nif (!SAFE.test(OFFER_ID)) throw new Error('OFFER_ID: letters, digits, _ ( ) - only');\nif (!['new', 'repeat'].includes(MODE)) throw new Error(\"MODE must be 'new' or 'repeat'\");\nif (!/^\\d{1,2}(-\\d{1,2})?$/.test(String(WEEK))) throw new Error(\"WEEK must look like '38' or '38-39'\");\nif (!Number.isInteger(MIN_DAYS_SINCE_LAST) || MIN_DAYS_SINCE_LAST < 0 || MIN_DAYS_SINCE_LAST > 365)\n  throw new Error('MIN_DAYS_SINCE_LAST must be 0-365');\nif (!Number.isInteger(BATCH) || BATCH < 1 || BATCH > 500) throw new Error('BATCH must be 1-500');\n\nreturn [{ json: {\n  campaign: CAMPAIGN,\n  source: SOURCE,\n  only_this_source: ONLY_THIS_SOURCE,\n  offer_id: OFFER_ID,\n  week: String(WEEK),\n  mode: MODE,\n  min_days: MIN_DAYS_SINCE_LAST,\n  products: PRODUCTS,\n  batch: BATCH,\n} }];\n"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "ac51e0cb-c171-45f0-8860-6b5018562773",
+      "name": "Get offers",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        -176,
+        -176
+      ],
+      "parameters": {
+        "query": "-- Every stored offer. Build email picks the one whose offer_id matches\n-- Run settings and lists the rest in its error message if it is missing.\nselect offer_id, offer from offers order by created_at;",
+        "options": {},
+        "operation": "executeQuery"
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Postgres"
+        }
+      },
+      "executeOnce": true,
+      "typeVersion": 2.7,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "b10bc418-24a4-4258-a7d2-b52608a58585",
+      "name": "Select companies",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        48,
+        -176
+      ],
+      "parameters": {
+        "query": "-- One contact per company, verified valid, company not blocked and not\n-- already in a live thread.\n--\n-- `sources` is comma-separated multi-value, so match per element -- never\n-- with = on the whole field, which silently drops rows carrying two tags.\n--\n-- Two independent guards, both on outreach_log rather than on a flag, so a\n-- run that crashes halfway can be restarted without mailing anyone twice:\n--   * offer-level -- a company that already got THIS offer_id can never be\n--                    picked again;\n--   * MODE        -- who is eligible at all.\n--       new    = no outreach_log row at all, in any campaign. The first\n--                send to a list: these firms have never been written to.\n--       repeat = already touched in this campaign, and the last touch is at\n--                least MIN_DAYS_SINCE_LAST days old.\n--\n-- SENDER SPLIT. The final select alternates A / B over a randomly ordered\n-- batch. That gives an exactly even split of volume between the two\n-- mailboxes and a random pairing of company to sender -- a plain coin flip\n-- per row would drift 10-20 either way over a batch of 300, which matters\n-- because each mailbox has its own sending reputation and quota.\n-- The assignment is made once, here, and travels with the row, so the same\n-- company is greeted, sent and logged under one sender.\nwith candidates as (\n  select distinct on (co.company_key)\n         c.id as contact_id,\n         c.email,\n         co.company_key,\n         co.company_name,\n         co.country,\n         not exists (\n           select 1 from outreach_log o where o.company_key = co.company_key\n         ) as is_first_touch\n    from contacts c\n    join companies co on co.company_key = c.company_key\n   where exists (\n           select 1 from unnest(string_to_array(c.sources, ',')) s\n            where trim(s) = '{{ $('Run settings').first().json.source }}'\n         )\n     and (not {{ $('Run settings').first().json.only_this_source }}::boolean\n          or array_length(string_to_array(co.sources, ','), 1) = 1)\n     and c.verification_status = 'valid'\n     and c.email_status is distinct from 'bounced'\n     and co.contact_status is null\n     and not exists (\n           select 1 from outreach_log o\n            where o.company_key = co.company_key\n              and o.campaign    = '{{ $('Run settings').first().json.campaign }}'\n              and o.notes       = 'offer:{{ $('Run settings').first().json.offer_id }}'\n         )\n     and (\n       ('{{ $('Run settings').first().json.mode }}' = 'new' and not exists (\n            select 1 from outreach_log o where o.company_key = co.company_key))\n       or\n       ('{{ $('Run settings').first().json.mode }}' = 'repeat' and exists (\n            select 1 from outreach_log o\n             where o.company_key = co.company_key\n               and o.campaign    = '{{ $('Run settings').first().json.campaign }}')\n        and (select max(o.event_date) from outreach_log o\n              where o.company_key = co.company_key\n                and o.campaign    = '{{ $('Run settings').first().json.campaign }}')\n            <= current_date - {{ $('Run settings').first().json.min_days }})\n     )\n   order by co.company_key, c.id\n),\npicked as (\n  select * from candidates order by random() limit {{ $('Run settings').first().json.batch }}\n)\nselect p.*,\n       case when row_number() over (order by random()) % 2 = 0 then 'A' else 'B' end as who\n  from picked p;\n",
+        "options": {},
+        "operation": "executeQuery"
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Postgres"
+        }
+      },
+      "executeOnce": true,
+      "typeVersion": 2.7
+    },
+    {
+      "id": "5442644f-1df5-48ee-bbdc-22cd61c94d17",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "position": [
+        272,
+        -176
+      ],
+      "parameters": {
+        "options": {}
+      },
+      "typeVersion": 3
+    },
+    {
+      "id": "76301aa6-0a5d-4bed-8bda-7c38e3ae96ff",
+      "name": "Build email",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        512,
+        -64
+      ],
+      "parameters": {
+        "jsCode": "// Builds one email. The offer text itself lives in the `offers` table —\n// edit it there, not here.\n//\n// The sender was already decided in \"Select companies\" (an even A / B split\n// over the batch), so all this node does with it is choose the matching\n// signature. Greeting, subject, body and signature therefore always belong to\n// the same person.\n\nconst cfg  = $('Run settings').first().json;\nconst rows = $('Get offers').all();\n\nconst row = rows.find(r => String(r.json.offer_id) === String(cfg.offer_id));\nif (!row) {\n  throw new Error(\n    `No row with offer_id=\"${cfg.offer_id}\" in the offers table. ` +\n    `Available: ${rows.map(r => r.json.offer_id).filter(Boolean).join(', ') || '(table is empty)'}`\n  );\n}\n\n// The stored offer keeps its own layout — an HTML table, or a block wrapped in\n// white-space: pre-wrap. Only the newlines need turning into <br>.\nconst offerHtml = String(row.json.offer).replace(/\\n/g, '<br>');\n\n// One signature per sending mailbox. Replace the placeholders with the real\n// name, phone, address and company of each sender.\nconst SIGNATURES = {\n  A: `\n<div style=\"font-family: Arial, sans-serif; color: #222; line-height: 1.2;\">\n    <p style=\"margin-bottom: 15px; font-size: 16px;\">Best regards, Sender A</p>\n    <div style=\"font-size: 14px;\">\n        <strong>Mob.:</strong> +00 000 000 000<br>\n        <strong>e-mail:</strong> sender-a@example.com<br>\n        <strong>Web:</strong> www.example.com\n    </div>\n    <hr style=\"border: 0; border-top: 1px solid #eee; margin: 15px 0;\">\n    <p style=\"font-size: 11px; color: #999; margin-top: 10px;\">\n        <i>If you’d rather not receive any more offers, please let me know with a quick <span style=\"color: #1155cc;\">\"Unsubscribe\"</span> reply.</i>\n    </p>\n</div>`,\n  B: `\n<div style=\"font-family: Arial, sans-serif; color: #222; line-height: 1.2;\">\n    <p style=\"margin-bottom: 15px; font-size: 16px;\">Best regards, Sender B</p>\n    <div style=\"font-size: 14px;\">\n        <strong>Mob.:</strong> +00 000 000 000<br>\n        <strong>e-mail:</strong> sender-b@example.com<br>\n        <strong>Web:</strong> www.example.com\n    </div>\n    <hr style=\"border: 0; border-top: 1px solid #eee; margin: 15px 0;\">\n    <p style=\"font-size: 11px; color: #999; margin-top: 10px;\">\n        <i>If you’d rather not receive any more offers, please let me know with a quick <span style=\"color: #1155cc;\">\"Unsubscribe\"</span> reply.</i>\n    </p>\n</div>`,\n};\n\nconst out = [];\n\nfor (const item of $input.all()) {\n  const d = item.json;\n\n  const who = String(d.who || '').trim();\n  // The Switch after this node routes on `who`. An unexpected value there\n  // would fall out of every branch and the item would vanish without a send\n  // and without a log row — stop instead.\n  if (!SIGNATURES[who]) {\n    throw new Error(`Row for ${d.company_key} has who=\"${d.who}\"; expected 'A' or 'B'`);\n  }\n\n  // company_name is filled for every row the query returns, but never greet\n  // anyone as \"undefined Team\" if that ever changes.\n  const name = String(d.company_name || '').trim();\n  const greeting = name ? `Dear ${name} Team,` : 'Dear Sir or Madam,';\n  const subject  = name\n    ? `Frozen meat and offal – Week ${cfg.week} – ${name}`\n    : `Frozen meat and offal – Week ${cfg.week}`;\n\n  const body =\n    `${greeting}<br><br>` +\n    `Please find below our available meat and offal offer for week ${cfg.week}.<br><br>` +\n    `${offerHtml}<br><br>` +\n    `Should you have any questions, or if you are interested in products not listed, feel free to reach out.<br><br>` +\n    SIGNATURES[who];\n\n  // Everything from the query is carried through so the logging nodes can read\n  // it with $('Build email').first() — safe, the loop hands over one item.\n  out.push({ json: { ...d, subject, body } });\n}\n\nreturn out;\n"
+      },
+      "typeVersion": 2
+    },
+    {
+      "id": "4197cd58-efcf-4b5a-938f-f58b31cb9896",
+      "name": "Switch",
+      "type": "n8n-nodes-base.switch",
+      "position": [
+        720,
+        -64
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "outputKey": "a",
+              "conditions": {
+                "options": {
+                  "version": 3,
+                  "leftValue": "",
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "01fe3e1f-1768-4824-a77a-1a6f6f1793bc",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.who }}",
+                    "rightValue": "A"
+                  }
+                ]
+              },
+              "renameOutput": true
+            },
+            {
+              "outputKey": "b",
+              "conditions": {
+                "options": {
+                  "version": 3,
+                  "leftValue": "",
+                  "caseSensitive": true,
+                  "typeValidation": "strict"
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "cc8bd9e3-26ff-475c-8f56-9eb547a3ea3f",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.who }}",
+                    "rightValue": "B"
+                  }
+                ]
+              },
+              "renameOutput": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "typeVersion": 3.4
+    },
+    {
+      "id": "e11858c9-fe11-4b0d-bcc5-d8a0f365502d",
+      "name": "Send as A",
+      "type": "n8n-nodes-base.gmail",
+      "position": [
+        944,
+        -176
+      ],
+      "webhookId": "35dc2ef1-e16b-406c-9609-43dd655830f2",
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        },
+        "subject": "={{ $json.subject }}"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Mail sender A"
+        }
+      },
+      "retryOnFail": true,
+      "typeVersion": 2.2
+    },
+    {
+      "id": "573771e7-ab9a-440b-881a-61a0b1c466cd",
+      "name": "Send as B",
+      "type": "n8n-nodes-base.gmail",
+      "position": [
+        944,
+        64
+      ],
+      "webhookId": "ed6a1f60-edd3-49a4-adbd-7967182b4936",
+      "parameters": {
+        "sendTo": "={{ $json.email }}",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        },
+        "subject": "={{ $json.subject }}"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "name": "Mail sender B"
+        }
+      },
+      "retryOnFail": true,
+      "typeVersion": 2.2
+    },
+    {
+      "id": "00a227d8-46e7-46b2-86e1-06b30cb88155",
+      "name": "Log to outreach_log",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1168,
+        -64
+      ],
+      "parameters": {
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "outreach_log",
+          "cachedResultName": "outreach_log"
+        },
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "columns": {
+          "value": {
+            "who": "={{ $('Build email').first().json.who }}",
+            "body": "={{ $('Build email').first().json.body }}",
+            "kind": "email",
+            "sent": "TRUE",
+            "notes": "=offer:{{ $('Run settings').first().json.offer_id }}",
+            "stage": "={{ $('Build email').first().json.is_first_touch ? 'intro' : 'followup' }}",
+            "source": "n8n",
+            "status": "sent",
+            "campaign": "={{ $('Run settings').first().json.campaign }}",
+            "products": "={{ $('Run settings').first().json.products }}",
+            "event_date": "={{ $now.toFormat('yyyy-MM-dd') }}",
+            "company_key": "={{ $('Build email').first().json.company_key }}",
+            "external_id": "={{ $json.id }}",
+            "contact_email": "={{ $('Build email').first().json.email }}"
+          },
+          "schema": [
+            {
+              "id": "company_key",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "company_key",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "contact_email",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "contact_email",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "campaign",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "campaign",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "stage",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "stage",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sent",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "sent",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notes",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "notes",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "who",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "who",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "event_date",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "event_date",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "products",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "products",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "kind",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": true,
+              "displayName": "kind",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "source",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "external_id",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "external_id",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "body",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "body",
+              "defaultMatch": false,
+              "canBeUsedToMatch": true
+            }
+          ],
+          "mappingMode": "defineBelow",
+          "matchingColumns": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Postgres"
+        }
+      },
+      "typeVersion": 2.7
+    },
+    {
+      "id": "58b2985b-451c-4627-b47c-53ec0a7f996b",
+      "name": "Mark contact sent",
+      "type": "n8n-nodes-base.postgres",
+      "position": [
+        1392,
+        -64
+      ],
+      "parameters": {
+        "table": {
+          "__rl": true,
+          "mode": "list",
+          "value": "contacts",
+          "cachedResultName": "contacts"
+        },
+        "schema": {
+          "__rl": true,
+          "mode": "list",
+          "value": "public"
+        },
+        "columns": {
+          "value": {
+            "id": "={{ $('Build email').first().json.contact_id }}",
+            "email_status": "sent"
+          },
+          "schema": [
+            {
+              "id": "id",
+              "type": "number",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "id",
+              "defaultMatch": true,
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "email_status",
+              "type": "string",
+              "display": true,
+              "removed": false,
+              "required": false,
+              "displayName": "email_status",
+              "defaultMatch": false,
+              "canBeUsedToMatch": false
+            }
+          ],
+          "mappingMode": "defineBelow",
+          "matchingColumns": [
+            "id"
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {},
+        "operation": "update"
+      },
+      "credentials": {
+        "postgres": {
+          "name": "Postgres"
+        }
+      },
+      "typeVersion": 2.7
+    },
+    {
+      "id": "befa29ca-02ae-4be7-ad85-7872394c5713",
+      "name": "Wait 20-45s",
+      "type": "n8n-nodes-base.wait",
+      "position": [
+        1600,
+        -64
+      ],
+      "webhookId": "c75e6736-dd25-42cf-b6f7-a127fe219cab",
+      "parameters": {
+        "amount": "={{ Math.floor(Math.random() * 26) + 20 }}"
+      },
+      "typeVersion": 1.1
+    },
+    {
+      "id": "33198ea9-1e5b-41fc-a154-9145fbd2bc8d",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -624,
+        128
+      ],
+      "parameters": {
+        "width": 460,
+        "height": 340,
+        "content": "## Offer send, straight from Postgres\n\nSet everything in **Run settings**, then Execute.\n\n- one address per company, verified valid only\n- **Select companies** splits the batch evenly between sender A and sender B at random\n- the re-send guard is `outreach_log`, not a flag, so a crashed run can be restarted without mailing anyone twice\n- offer text lives in the `offers` table, keyed by `offer_id`\n- for a follow-up offer: new `OFFER_ID`, `MODE = 'repeat'`, `BATCH` = the size of the list. Bounced and blocked companies drop out on their own."
+      },
+      "typeVersion": 1
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Run settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run settings": {
+      "main": [
+        [
+          {
+            "node": "Get offers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get offers": {
+      "main": [
+        [
+          {
+            "node": "Select companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select companies": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Build email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build email": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Send as A",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send as B",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send as A": {
+      "main": [
+        [
+          {
+            "node": "Log to outreach_log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send as B": {
+      "main": [
+        [
+          {
+            "node": "Log to outreach_log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to outreach_log": {
+      "main": [
+        [
+          {
+            "node": "Mark contact sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark contact sent": {
+      "main": [
+        [
+          {
+            "node": "Wait 20-45s",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 20-45s": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

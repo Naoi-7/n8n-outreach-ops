@@ -1,0 +1,54 @@
+{
+  "name": "error-handler",
+  "nodes": [
+    {
+      "id": "97335f9d-aa81-4821-8166-814c18104361",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {},
+      "typeVersion": 1
+    },
+    {
+      "id": "44058d48-17df-4573-b772-b4b27d8d6fa9",
+      "name": "Send a text message",
+      "type": "n8n-nodes-base.telegram",
+      "position": [
+        208,
+        0
+      ],
+      "webhookId": "d95f8fa3-4c0d-41a8-b754-9056d52ac512",
+      "parameters": {
+        "chatId": "YOUR_CHAT_ID",
+        "text": "=⚠️ n8n Error\n\nWorkflow: {{ $json.workflow.name }}\nNode: {{ $json.execution.lastNodeExecuted }}\nError: {{ $json.execution.error.message }}\n\nExecution ID: {{ $json.execution.id }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "telegramApi": {
+          "name": "Telegram alerts"
+        }
+      },
+      "typeVersion": 1.2
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Send a text message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
