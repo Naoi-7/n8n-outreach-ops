@@ -10,7 +10,7 @@ those rows. Same Postgres schema, same conventions: run that repo's
 `schema.sql` first, then this one.
 
 Three n8n workflows, one schema file, one seed. Built and run in production
-at a small B2B food-trading company, where every send costs sender
+at a B2B food-trading company, where every send costs sender
 reputation and every bounce is a number someone looks at.
 
 ## The problem
